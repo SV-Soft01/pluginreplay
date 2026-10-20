@@ -10,10 +10,9 @@
 namespace SVReplay {
 
 MultiCamDock::MultiCamDock(QWidget *parent)
-    : QDockWidget("SV MultiCam Replay", parent)
+    : QWidget(parent)
 {
     setObjectName("SVMultiCamReplayDock");
-    setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
 
     SetupUI();
     LoadSettingsToUI();
@@ -153,7 +152,9 @@ void MultiCamDock::SetupUI()
 
     mainLayout->addLayout(actionLayout);
 
-    setWidget(mainContainer);
+    auto *outerLayout = new QVBoxLayout(this);
+    outerLayout->setContentsMargins(0, 0, 0, 0);
+    outerLayout->addWidget(mainContainer);
     connect(m_sourcesListWidget, &QListWidget::itemChanged, this, &MultiCamDock::OnSourceItemChanged);
 }
 

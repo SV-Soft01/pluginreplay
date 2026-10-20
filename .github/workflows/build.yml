@@ -25,11 +25,31 @@ jobs:
         arch: 'win64_msvc2019_64'
 
     - name: Setup OBS Studio Prebuilt SDK
-      shell: bash
+      shell: pwsh
       run: |
-        curl -L -o obs-studio.zip https://github.com/obsproject/obs-studio/releases/download/30.2.3/OBS-Studio-30.2.3-Windows.zip
-        7z x obs-studio.zip -oobs-install
+        curl.exe -L -o obs-studio.zip https://github.com/obsproject/obs-studio/releases/download/30.2.3/OBS-Studio-30.2.3-Windows.zip
+        7z.exe x obs-studio.zip -oobs-install
         git clone --depth 1 --branch 30.2.3 https://github.com/obsproject/obs-studio.git obs-src
+
+        # Generate import library obs.lib from obs.dll
+        "EXPORTS" | Out-File -Encoding ascii obs.def
+        $obsExports = dumpbin /exports obs-install/bin/64bit/obs.dll
+        foreach ($line in $obsExports) {
+            if ($line -match "^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)") {
+                $matches[1] | Out-File -Append -Encoding ascii obs.def
+            }
+        }
+        lib.exe /def:obs.def /out:obs-install/bin/64bit/obs.lib /machine:x64
+
+        # Generate import library obs-frontend-api.lib from obs-frontend-api.dll
+        "EXPORTS" | Out-File -Encoding ascii obs-frontend-api.def
+        $frontendExports = dumpbin /exports obs-install/bin/64bit/obs-frontend-api.dll
+        foreach ($line in $frontendExports) {
+            if ($line -match "^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+(\S+)") {
+                $matches[1] | Out-File -Append -Encoding ascii obs-frontend-api.def
+            }
+        }
+        lib.exe /def:obs-frontend-api.def /out:obs-install/bin/64bit/obs-frontend-api.lib /machine:x64
 
     - name: Configure CMake
       run: |

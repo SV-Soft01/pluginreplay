@@ -1,397 +1,655 @@
 #include "multicam-manager.hpp"
-#include "mp4-muxer.hpp"
+
 #include <obs.h>
-#include <obs-module.h>
+#include <util/base.h>
 #include <util/platform.h>
+
+#include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
-#include <filesystem>
+#include <system_error>
 
 namespace SVReplay {
 
 namespace fs = std::filesystem;
 
-static void OBS_MainRenderCallback(void *param, uint32_t /*cx*/, uint32_t /*cy*/)
+namespace {
+
+constexpr uint64_t kSessionTimeoutNs = 30ULL * 1000000000ULL;
+
+std::string PathToUtf8(const fs::path &path)
 {
-    auto *manager = static_cast<MultiCamManager*>(param);
-    if (manager) {
-        manager->OnMainRenderTick();
+    const auto u8 = path.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
+std::string SanitizeForFilename(const std::string &name)
+{
+    static const std::string illegal = "\\/:*?\"<>| ";
+    std::string out = name;
+    for (char &c : out) {
+        if (illegal.find(c) != std::string::npos || static_cast<unsigned char>(c) < 32) {
+            c = '_';
+        }
+    }
+    return out.empty() ? std::string("camara") : out;
+}
+
+const char *EncoderToString(EncoderPreference pref)
+{
+    switch (pref) {
+    case EncoderPreference::Nvenc:
+        return "nvenc";
+    case EncoderPreference::X264:
+        return "x264";
+    case EncoderPreference::Auto:
+    default:
+        return "auto";
     }
 }
 
-MultiCamManager& MultiCamManager::Instance()
+EncoderPreference EncoderFromString(const std::string &text)
 {
-    static MultiCamManager s_instance;
-    return s_instance;
+    if (text == "nvenc") {
+        return EncoderPreference::Nvenc;
+    }
+    if (text == "x264") {
+        return EncoderPreference::X264;
+    }
+    return EncoderPreference::Auto;
 }
 
-MultiCamManager::MultiCamManager() = default;
+} // namespace
+
+MultiCamManager &MultiCamManager::Instance()
+{
+    static MultiCamManager instance;
+    return instance;
+}
 
 MultiCamManager::~MultiCamManager()
 {
     Shutdown();
 }
 
-void MultiCamManager::Initialize()
+// ---------------------------------------------------------------------------
+// Ciclo de vida
+// ---------------------------------------------------------------------------
+
+void MultiCamManager::Initialize(const std::string &configFilePath)
 {
-    if (m_isInitialized.exchange(true)) {
+    if (m_initialized.exchange(true)) {
         return;
     }
 
-    // Ruta de salida por defecto en la carpeta de videos del usuario
-    const char *userProfile = getenv("USERPROFILE");
-    if (userProfile) {
-        m_outputDirectory = std::string(userProfile) + "\\Videos\\Replays";
-    } else {
-        m_outputDirectory = "C:\\Replays";
+    m_configPath = configFilePath;
+    LoadGlobalConfig();
+
+    {
+        std::lock_guard<std::mutex> lock(m_workerMutex);
+        m_workerStop = false;
     }
+    m_worker = std::thread(&MultiCamManager::WorkerLoop, this);
 
-    LoadConfiguration();
-
-    // Registrar el callback de renderizado en el subsistema gráfico de OBS
-    obs_enter_graphics();
-    if (!m_renderCallbackRegistered) {
-        obs_add_main_render_callback(OBS_MainRenderCallback, this);
-        m_renderCallbackRegistered = true;
-    }
-    obs_leave_graphics();
-
-    blog(LOG_INFO, "[SV MultiCam] Gestor multicámara inicializado con éxito.");
+    blog(LOG_INFO, "[SV MultiCam] Gestor multicámara inicializado.");
 }
 
 void MultiCamManager::Shutdown()
 {
-    if (!m_isInitialized.exchange(false)) {
+    if (!m_initialized.exchange(false)) {
         return;
     }
-
-    SaveConfiguration();
-
-    obs_enter_graphics();
-    if (m_renderCallbackRegistered) {
-        obs_remove_main_render_callback(OBS_MainRenderCallback, this);
-        m_renderCallbackRegistered = false;
-    }
-    obs_leave_graphics();
-
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    for (auto &pair : m_sources) {
-        if (pair.second) {
-            pair.second->StopCapture();
-        }
-    }
-    m_sources.clear();
-    blog(LOG_INFO, "[SV MultiCam] Gestor multicámara finalizado correctamente.");
-}
-
-void MultiCamManager::OnMainRenderTick()
-{
-    if (!m_isInitialized.load()) {
-        return;
-    }
-
-    uint64_t now_ns = os_gettime_ns();
-
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    for (auto &pair : m_sources) {
-        if (pair.second) {
-            pair.second->RenderAndCapture(now_ns);
-        }
-    }
-}
-
-void MultiCamManager::SetSourceActive(const std::string &sourceName, bool active)
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-
-    auto it = m_sources.find(sourceName);
-    if (active) {
-        if (it == m_sources.end()) {
-            auto buffer = std::make_unique<SourceBuffer>(sourceName);
-            buffer->SetBufferDuration(m_bufferDuration);
-            buffer->StartCapture();
-            m_sources[sourceName] = std::move(buffer);
-        }
-    } else {
-        if (it != m_sources.end()) {
-            it->second->StopCapture();
-            m_sources.erase(it);
-        }
-    }
-}
-
-bool MultiCamManager::IsSourceActive(const std::string &sourceName) const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    return m_sources.find(sourceName) != m_sources.end();
-}
-
-std::vector<std::string> MultiCamManager::GetActiveSources() const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    std::vector<std::string> activeList;
-    activeList.reserve(m_sources.size());
-    for (const auto &pair : m_sources) {
-        activeList.push_back(pair.first);
-    }
-    return activeList;
-}
-
-void MultiCamManager::SetBufferDuration(int seconds)
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    m_bufferDuration = seconds;
-    for (auto &pair : m_sources) {
-        if (pair.second) {
-            pair.second->SetBufferDuration(seconds);
-        }
-    }
-}
-
-void MultiCamManager::SetOutputDirectory(const std::string &dirPath)
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    m_outputDirectory = dirPath;
-}
-
-std::string MultiCamManager::GetOutputDirectory() const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    return m_outputDirectory;
-}
-
-void MultiCamManager::SetFilePrefix(const std::string &prefix)
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    m_filePrefix = prefix;
-}
-
-std::string MultiCamManager::GetFilePrefix() const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    return m_filePrefix;
-}
-
-size_t MultiCamManager::GetTotalEstimatedMemoryBytes() const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    size_t total = 0;
-    for (const auto &pair : m_sources) {
-        if (pair.second) {
-            total += pair.second->GetEstimatedMemoryBytes();
-        }
-    }
-    return total;
-}
-
-std::string MultiCamManager::GetSourceStatusString(const std::string &sourceName) const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    auto it = m_sources.find(sourceName);
-    if (it != m_sources.end() && it->second) {
-        return it->second->GetStatusString();
-    }
-    return "Inactivo";
-}
-
-size_t MultiCamManager::GetSourceBufferedFrames(const std::string &sourceName) const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    auto it = m_sources.find(sourceName);
-    if (it != m_sources.end() && it->second) {
-        return it->second->GetBufferedFrameCount();
-    }
-    return 0;
-}
-
-double MultiCamManager::GetSourceBufferedSeconds(const std::string &sourceName) const
-{
-    std::lock_guard<std::mutex> lock(m_managerMutex);
-    auto it = m_sources.find(sourceName);
-    if (it != m_sources.end() && it->second) {
-        return it->second->GetBufferedDurationSeconds();
-    }
-    return 0.0;
-}
-
-std::string MultiCamManager::GenerateTimestampString() const
-{
-    auto now = std::chrono::system_clock::now();
-    std::time_t in_time_t = std::chrono::system_clock::to_time_t(now);
-    std::tm buf;
-#if defined(_WIN32)
-    localtime_s(&buf, &in_time_t);
-#else
-    localtime_r(&in_time_t, &buf);
-#endif
-    std::ostringstream ss;
-    ss << std::put_time(&buf, "%Y%m%d_%H%M%S");
-    return ss.str();
-}
-
-bool MultiCamManager::TriggerSaveReplay(SaveCompletionCallback callback)
-{
-    bool expected = false;
-    if (!m_isSaving.compare_exchange_strong(expected, true)) {
-        blog(LOG_WARNING, "[SV MultiCam] Ya hay un proceso de guardado en curso. Ignorando disparo.");
-        return false;
-    }
-
-    uint64_t now_ns = os_gettime_ns();
-    uint64_t duration_ns = static_cast<uint64_t>(m_bufferDuration) * 1000000000ULL;
-    uint64_t start_ns = (now_ns > duration_ns) ? (now_ns - duration_ns) : 0;
-
-    uint32_t playId = m_playCounter.fetch_add(1);
-    std::string timestampStr = GenerateTimestampString();
-    std::string outputDir = GetOutputDirectory();
-    std::string prefix = GetFilePrefix();
-
-    // Estructura de extracción de fotogramas sincronizados
-    struct SourceExtraction {
-        std::string name;
-        std::vector<VideoFramePacket> frames;
-    };
-    std::vector<SourceExtraction> extractions;
 
     {
-        std::lock_guard<std::mutex> lock(m_managerMutex);
-        extractions.reserve(m_sources.size());
-        for (const auto &pair : m_sources) {
-            if (pair.second) {
-                SourceExtraction ext;
-                ext.name = pair.first;
-                ext.frames = pair.second->ExtractReplaySlice(start_ns, now_ns);
-                extractions.push_back(std::move(ext));
-            }
-        }
+        std::lock_guard<std::mutex> lock(m_workerMutex);
+        m_workerStop = true;
+    }
+    m_workerCv.notify_all();
+    if (m_worker.joinable()) {
+        m_worker.join();
     }
 
-    if (extractions.empty()) {
-        m_isSaving.store(false);
-        blog(LOG_WARNING, "[SV MultiCam] No hay fuentes activas seleccionadas para guardar repetición.");
-        return false;
+    StopAllPipelines();
+
+    // Esperar (máx. 5 s) a que terminen los renombrados de clips en curso.
+    for (int i = 0; i < 100 && m_pendingWorkers.load() > 0; ++i) {
+        os_sleep_ms(50);
     }
 
-    // Delegar la codificación y escritura de archivos MP4 al hilo de trabajo asíncrono
-    std::thread([this, extractions = std::move(extractions), playId, timestampStr, outputDir, prefix, callback]() {
-        ReplaySaveResult result;
-        result.playId = playId;
-        result.success = true;
-
-        blog(LOG_INFO, "[SV MultiCam] Iniciando guardado asíncrono de repetición #%04u para %zu cámaras...",
-             playId, extractions.size());
-
-        for (const auto &item : extractions) {
-            MuxerOptions options;
-            options.outputDirectory = outputDir;
-            options.filenamePrefix = prefix;
-            options.playId = playId;
-            options.timestampStr = timestampStr;
-            options.sourceName = item.name;
-            options.fps = 60;
-
-            std::string finalPath;
-            std::string errorMessage;
-
-            bool success = MP4Muxer::SaveClipsToMP4(options, item.frames, finalPath, errorMessage);
-            if (success) {
-                result.savedFiles.push_back(finalPath);
-                result.totalClips++;
-                blog(LOG_INFO, "[SV MultiCam] Clip generado exitosamente: %s", finalPath.c_str());
-            } else {
-                result.success = false;
-                result.errors.push_back(item.name + ": " + errorMessage);
-                blog(LOG_ERROR, "[SV MultiCam] Error al guardar clip para '%s': %s",
-                     item.name.c_str(), errorMessage.c_str());
-            }
-        }
-
-        m_isSaving.store(false);
-
-        if (callback) {
-            callback(result);
-        }
-    }).detach();
-
-    return true;
+    SetResultListener(nullptr);
+    SaveGlobalConfig();
+    blog(LOG_INFO, "[SV MultiCam] Gestor multicámara finalizado.");
 }
 
-void MultiCamManager::LoadConfiguration()
+// ---------------------------------------------------------------------------
+// Hilo de supervisión
+// ---------------------------------------------------------------------------
+
+void MultiCamManager::WorkerLoop()
 {
-    char *configPath = obs_module_config_path("config.json");
-    if (!configPath) {
+    std::unique_lock<std::mutex> lock(m_workerMutex);
+    while (!m_workerStop) {
+        m_workerCv.wait_for(lock, std::chrono::milliseconds(1000), [this] { return m_workerStop; });
+        if (m_workerStop) {
+            break;
+        }
+        lock.unlock();
+        TickPipelines();
+        CheckSessionTimeout();
+        lock.lock();
+    }
+}
+
+void MultiCamManager::TickPipelines()
+{
+    std::vector<std::shared_ptr<CameraPipeline>> graveyard;
+    std::vector<std::shared_ptr<CameraPipeline>> active;
+    ReplaySettings settings;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        graveyard.swap(m_graveyard);
+        settings = m_settings;
+        active.reserve(m_pipelines.size());
+        for (auto &pair : m_pipelines) {
+            active.push_back(pair.second);
+        }
+    }
+
+    // Detener (fuera del candado) las cámaras que el usuario desmarcó.
+    for (auto &pipeline : graveyard) {
+        pipeline->Retire();
+    }
+    graveyard.clear();
+
+    for (auto &pipeline : active) {
+        pipeline->Tick(settings);
+    }
+
+    RefreshStatusCache();
+}
+
+void MultiCamManager::RefreshStatusCache()
+{
+    std::vector<std::shared_ptr<CameraPipeline>> pipelines;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        pipelines.reserve(m_pipelines.size());
+        for (auto &pair : m_pipelines) {
+            pipelines.push_back(pair.second);
+        }
+    }
+
+    std::vector<CameraStatus> statuses;
+    statuses.reserve(pipelines.size());
+    for (auto &pipeline : pipelines) {
+        statuses.push_back(pipeline->GetStatus());
+    }
+
+    std::lock_guard<std::mutex> lock(m_statusMutex);
+    m_statusCache = std::move(statuses);
+}
+
+std::vector<CameraStatus> MultiCamManager::GetStatuses() const
+{
+    std::lock_guard<std::mutex> lock(m_statusMutex);
+    return m_statusCache;
+}
+
+// ---------------------------------------------------------------------------
+// Cámaras
+// ---------------------------------------------------------------------------
+
+void MultiCamManager::SetCameraEnabled(const std::string &name, bool enabled)
+{
+    if (name.empty()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (enabled) {
+            m_desired.insert(name);
+        } else {
+            m_desired.erase(name);
+        }
+        ReconcileLocked();
+    }
+    RefreshStatusCache();
+}
+
+bool MultiCamManager::IsCameraEnabled(const std::string &name) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_desired.count(name) > 0;
+}
+
+std::vector<std::string> MultiCamManager::GetEnabledCameras() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return std::vector<std::string>(m_desired.begin(), m_desired.end());
+}
+
+void MultiCamManager::SetEnabledCameras(const std::vector<std::string> &names)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_desired.clear();
+    for (const auto &name : names) {
+        if (!name.empty()) {
+            m_desired.insert(name);
+        }
+    }
+}
+
+void MultiCamManager::ApplyEnabledCameras()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        ReconcileLocked();
+    }
+    RefreshStatusCache();
+}
+
+void MultiCamManager::ReconcileLocked()
+{
+    // Pipelines que sobran -> al cementerio (los detiene el hilo de supervisión).
+    for (auto it = m_pipelines.begin(); it != m_pipelines.end();) {
+        if (m_desired.count(it->first) == 0) {
+            m_graveyard.push_back(std::move(it->second));
+            it = m_pipelines.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Pipelines que faltan -> se crean detenidos; el siguiente Tick los arranca.
+    for (const auto &name : m_desired) {
+        if (m_pipelines.count(name) == 0) {
+            m_pipelines[name] = std::make_shared<CameraPipeline>(
+                name, [this](const std::string &camera, const std::string &path) { OnClipSaved(camera, path); });
+        }
+    }
+}
+
+void MultiCamManager::StopAllPipelines()
+{
+    std::vector<std::shared_ptr<CameraPipeline>> toStop;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto &pair : m_pipelines) {
+            toStop.push_back(std::move(pair.second));
+        }
+        m_pipelines.clear();
+        for (auto &pipeline : m_graveyard) {
+            toStop.push_back(std::move(pipeline));
+        }
+        m_graveyard.clear();
+    }
+
+    for (auto &pipeline : toStop) {
+        pipeline->Retire();
+    }
+    toStop.clear();
+
+    std::lock_guard<std::mutex> lock(m_statusMutex);
+    m_statusCache.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Ajustes
+// ---------------------------------------------------------------------------
+
+ReplaySettings MultiCamManager::GetSettings() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_settings;
+}
+
+void MultiCamManager::UpdateSettings(const ReplaySettings &newSettings)
+{
+    ReplaySettings clamped = newSettings;
+    clamped.Clamp();
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        const bool restart = m_settings.RequiresPipelineRestart(clamped);
+        m_settings = clamped;
+        if (restart) {
+            for (auto &pair : m_pipelines) {
+                pair.second->RequestRestart();
+            }
+        }
+    }
+    SaveGlobalConfig();
+}
+
+void MultiCamManager::LoadGlobalConfig()
+{
+    if (m_configPath.empty()) {
         return;
     }
 
-    obs_data_t *data = obs_data_create_from_json_file(configPath);
-    if (data) {
-        m_bufferDuration = static_cast<int>(obs_data_get_int(data, "buffer_duration_sec"));
-        if (m_bufferDuration <= 0) m_bufferDuration = 10;
-
-        const char *dir = obs_data_get_string(data, "output_directory");
-        if (dir && strlen(dir) > 0) {
-            m_outputDirectory = dir;
-        }
-
-        const char *prefix = obs_data_get_string(data, "filename_prefix");
-        if (prefix && strlen(prefix) > 0) {
-            m_filePrefix = prefix;
-        }
-
-        m_playCounter.store(static_cast<uint32_t>(obs_data_get_int(data, "last_play_id")) + 1);
-
-        obs_data_array_t *sourcesArray = obs_data_get_array(data, "active_sources");
-        if (sourcesArray) {
-            size_t count = obs_data_array_count(sourcesArray);
-            for (size_t i = 0; i < count; ++i) {
-                obs_data_t *item = obs_data_array_item(sourcesArray, i);
-                const char *sName = obs_data_get_string(item, "name");
-                if (sName && strlen(sName) > 0) {
-                    SetSourceActive(sName, true);
-                }
-                obs_data_release(item);
-            }
-            obs_data_array_release(sourcesArray);
-        }
-
-        obs_data_release(data);
-        blog(LOG_INFO, "[SV MultiCam] Configuración cargada desde %s", configPath);
+    obs_data_t *data = obs_data_create_from_json_file(m_configPath.c_str());
+    if (!data) {
+        return;
     }
-    bfree(configPath);
+
+    ReplaySettings loaded;
+    loaded.bufferSeconds = static_cast<int>(obs_data_get_int(data, "buffer_seconds"));
+    if (loaded.bufferSeconds <= 0) {
+        loaded.bufferSeconds = 10;
+    }
+    loaded.videoBitrateKbps = static_cast<int>(obs_data_get_int(data, "video_bitrate_kbps"));
+    if (loaded.videoBitrateKbps <= 0) {
+        loaded.videoBitrateKbps = 12000;
+    }
+    loaded.audioTrack = static_cast<int>(obs_data_get_int(data, "audio_track"));
+    if (loaded.audioTrack <= 0) {
+        loaded.audioTrack = 6;
+    }
+    loaded.encoder = EncoderFromString(obs_data_get_string(data, "encoder"));
+
+    const char *directory = obs_data_get_string(data, "output_directory");
+    if (directory && *directory) {
+        loaded.outputDirectory = directory;
+    }
+    const char *prefix = obs_data_get_string(data, "file_prefix");
+    if (prefix && *prefix) {
+        loaded.filePrefix = prefix;
+    }
+
+    const auto lastPlay = static_cast<uint32_t>(obs_data_get_int(data, "last_play_id"));
+    m_playCounter.store(lastPlay + 1);
+
+    obs_data_release(data);
+    loaded.Clamp();
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_settings = loaded;
 }
 
-void MultiCamManager::SaveConfiguration()
+void MultiCamManager::SaveGlobalConfig()
 {
-    char *configPath = obs_module_config_path("config.json");
-    if (!configPath) {
+    if (m_configPath.empty()) {
         return;
+    }
+
+    // La carpeta de configuración del plugin puede no existir todavía.
+    std::error_code ec;
+    fs::create_directories(fs::u8path(m_configPath).parent_path(), ec);
+
+    ReplaySettings settings;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        settings = m_settings;
     }
 
     obs_data_t *data = obs_data_create();
-    obs_data_set_int(data, "buffer_duration_sec", m_bufferDuration);
-    obs_data_set_string(data, "output_directory", m_outputDirectory.c_str());
-    obs_data_set_string(data, "filename_prefix", m_filePrefix.c_str());
-    obs_data_set_int(data, "last_play_id", m_playCounter.load());
+    obs_data_set_int(data, "buffer_seconds", settings.bufferSeconds);
+    obs_data_set_int(data, "video_bitrate_kbps", settings.videoBitrateKbps);
+    obs_data_set_int(data, "audio_track", settings.audioTrack);
+    obs_data_set_string(data, "encoder", EncoderToString(settings.encoder));
+    obs_data_set_string(data, "output_directory", settings.outputDirectory.c_str());
+    obs_data_set_string(data, "file_prefix", settings.filePrefix.c_str());
+    obs_data_set_int(data, "last_play_id", static_cast<long long>(m_playCounter.load()) - 1);
 
-    obs_data_array_t *sourcesArray = obs_data_array_create();
+    if (!obs_data_save_json_safe(data, m_configPath.c_str(), "tmp", "bak")) {
+        blog(LOG_WARNING, "[SV MultiCam] No se pudo guardar la configuración en %s", m_configPath.c_str());
+    }
+    obs_data_release(data);
+}
+
+// ---------------------------------------------------------------------------
+// Guardado de repeticiones
+// ---------------------------------------------------------------------------
+
+void MultiCamManager::SetResultListener(SaveResultListener listener)
+{
+    std::lock_guard<std::mutex> lock(m_listenerMutex);
+    m_listener = std::move(listener);
+}
+
+bool MultiCamManager::IsSaving() const
+{
+    std::lock_guard<std::mutex> lock(m_sessionMutex);
+    return m_session.active;
+}
+
+std::string MultiCamManager::GenerateTimestampString()
+{
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    std::tm local{};
+#if defined(_WIN32)
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&local, "%Y%m%d_%H%M%S");
+    return ss.str();
+}
+
+bool MultiCamManager::TriggerSaveReplay(std::string *outError)
+{
+    auto fail = [&](const std::string &message) {
+        blog(LOG_WARNING, "[SV MultiCam] %s", message.c_str());
+        if (outError) {
+            *outError = message;
+        }
+        return false;
+    };
+
+    // Cámaras que tienen búfer activo en este instante.
+    std::vector<std::shared_ptr<CameraPipeline>> pipelines;
+    ReplaySettings settings;
     {
-        std::lock_guard<std::mutex> lock(m_managerMutex);
-        for (const auto &pair : m_sources) {
-            obs_data_t *item = obs_data_create();
-            obs_data_set_string(item, "name", pair.first.c_str());
-            obs_data_array_push_back(sourcesArray, item);
-            obs_data_release(item);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        settings = m_settings;
+        for (auto &pair : m_pipelines) {
+            pipelines.push_back(pair.second);
         }
     }
-    obs_data_set_array(data, "active_sources", sourcesArray);
-    obs_data_array_release(sourcesArray);
+    if (pipelines.empty()) {
+        return fail("No hay cámaras seleccionadas.");
+    }
 
-    obs_data_save_json_safe(data, configPath, "tmp", "bak");
-    obs_data_release(data);
-    bfree(configPath);
-    blog(LOG_INFO, "[SV MultiCam] Configuración guardada correctamente.");
+    {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        if (m_session.active) {
+            return fail("Ya hay un guardado en curso.");
+        }
+        m_session = SaveSession();
+        m_session.active = true;
+        m_session.playId = m_playCounter.fetch_add(1);
+        m_session.timestamp = GenerateTimestampString();
+        m_session.prefix = settings.filePrefix;
+        m_session.startedNs = os_gettime_ns();
+        m_session.result.playId = m_session.playId;
+        for (auto &pipeline : pipelines) {
+            m_session.pending.insert(pipeline->Name());
+        }
+    }
+
+    // Disparar todas las cámaras seguidas: comparten el mismo instante de corte.
+    std::vector<std::string> notReady;
+    for (auto &pipeline : pipelines) {
+        if (!pipeline->RequestSave()) {
+            notReady.push_back(pipeline->Name());
+        }
+    }
+
+    bool finishNow = false;
+    SaveSession snapshot;
+    {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        for (const auto &name : notReady) {
+            m_session.pending.erase(name);
+            m_session.result.errors.push_back(name + ": la cámara aún no tiene búfer activo.");
+        }
+        if (m_session.pending.empty()) {
+            finishNow = true;
+            snapshot = m_session;
+            m_session.active = false;
+        }
+    }
+
+    SaveGlobalConfig(); // persiste el contador de jugadas
+
+    if (finishNow) {
+        FinishSession(snapshot);
+        if (outError) {
+            *outError = "Ninguna cámara tenía búfer activo todavía.";
+        }
+        return false;
+    }
+
+    blog(LOG_INFO, "[SV MultiCam] Guardando repetición #%04u en %zu cámaras...", m_session.playId,
+         pipelines.size() - notReady.size());
+    return true;
+}
+
+void MultiCamManager::OnClipSaved(const std::string &cameraName, const std::string &savedPath)
+{
+    uint32_t playId = 0;
+    std::string timestamp;
+    std::string prefix;
+    {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        if (!m_session.active || m_session.pending.count(cameraName) == 0) {
+            return;
+        }
+        playId = m_session.playId;
+        timestamp = m_session.timestamp;
+        prefix = m_session.prefix;
+    }
+
+    // El renombrado puede tener que esperar a que OBS suelte el archivo: se hace fuera del
+    // hilo de OBS, con reintentos.
+    m_pendingWorkers.fetch_add(1);
+    std::thread([this, cameraName, savedPath, playId, timestamp, prefix]() {
+        FinalizeClip(cameraName, savedPath, playId, timestamp, prefix);
+        m_pendingWorkers.fetch_sub(1);
+    }).detach();
+}
+
+void MultiCamManager::FinalizeClip(const std::string &cameraName, const std::string &savedPath, uint32_t playId,
+                                   const std::string &timestamp, const std::string &prefix)
+{
+    if (savedPath.empty()) {
+        CompleteClip(cameraName, false, "", "OBS no informó la ruta del clip guardado.");
+        return;
+    }
+
+    const fs::path source = fs::u8path(savedPath);
+    const fs::path directory = source.parent_path();
+    std::string extension = PathToUtf8(source.extension());
+    if (extension.empty()) {
+        extension = ".mp4";
+    }
+
+    std::ostringstream name;
+    name << SanitizeForFilename(prefix.empty() ? std::string("replay") : prefix) << "_" << std::setw(4)
+         << std::setfill('0') << playId << "_" << timestamp << "_" << SanitizeForFilename(cameraName);
+    const std::string baseName = name.str();
+
+    fs::path target = directory / fs::u8path(baseName + extension);
+    std::error_code ec;
+    for (int suffix = 1; fs::exists(target, ec) && suffix < 100; ++suffix) {
+        target = directory / fs::u8path(baseName + "_" + std::to_string(suffix) + extension);
+    }
+
+    std::string lastError;
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        ec.clear();
+        if (fs::exists(source, ec)) {
+            fs::rename(source, target, ec);
+            if (!ec) {
+                CompleteClip(cameraName, true, PathToUtf8(target), "");
+                return;
+            }
+            lastError = ec.message();
+        } else {
+            lastError = "el archivo guardado por OBS no existe.";
+        }
+        os_sleep_ms(250);
+    }
+
+    CompleteClip(cameraName, false, "", "No se pudo renombrar el clip: " + lastError);
+}
+
+void MultiCamManager::CompleteClip(const std::string &cameraName, bool ok, const std::string &finalPath,
+                                   const std::string &error)
+{
+    SaveSession finished;
+    bool done = false;
+    {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        if (!m_session.active) {
+            return;
+        }
+        m_session.pending.erase(cameraName);
+        if (ok) {
+            m_session.result.savedFiles.push_back(finalPath);
+            m_session.result.totalClips++;
+            blog(LOG_INFO, "[SV MultiCam] Clip guardado: %s", finalPath.c_str());
+        } else {
+            m_session.result.errors.push_back(cameraName + ": " + error);
+            blog(LOG_ERROR, "[SV MultiCam] Error con el clip de '%s': %s", cameraName.c_str(), error.c_str());
+        }
+        if (m_session.pending.empty()) {
+            finished = m_session;
+            m_session.active = false;
+            done = true;
+        }
+    }
+
+    if (done) {
+        FinishSession(finished);
+    }
+}
+
+void MultiCamManager::CheckSessionTimeout()
+{
+    SaveSession finished;
+    bool done = false;
+    {
+        std::lock_guard<std::mutex> lock(m_sessionMutex);
+        if (!m_session.active) {
+            return;
+        }
+        if (os_gettime_ns() - m_session.startedNs < kSessionTimeoutNs) {
+            return;
+        }
+        for (const auto &name : m_session.pending) {
+            m_session.result.errors.push_back(name + ": OBS no confirmó el guardado a tiempo.");
+        }
+        m_session.pending.clear();
+        finished = m_session;
+        m_session.active = false;
+        done = true;
+    }
+
+    if (done) {
+        FinishSession(finished);
+    }
+}
+
+void MultiCamManager::FinishSession(SaveSession &session)
+{
+    session.result.success = session.result.errors.empty() && session.result.totalClips > 0;
+    blog(LOG_INFO, "[SV MultiCam] Repetición #%04u terminada: %d clips, %zu errores.", session.playId,
+         session.result.totalClips, session.result.errors.size());
+
+    SaveResultListener listener;
+    {
+        std::lock_guard<std::mutex> lock(m_listenerMutex);
+        listener = m_listener;
+    }
+    if (listener) {
+        listener(session.result);
+    }
 }
 
 } // namespace SVReplay

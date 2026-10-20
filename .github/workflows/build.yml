@@ -69,6 +69,20 @@ jobs:
         "LIBOBS_INC=$libobsDir" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
         "OBS_BIN=$binDir" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
+    - name: Generate obsconfig.h (generado por CMake en OBS, no viene en el repo)
+      shell: pwsh
+      run: |
+        $content = @'
+        #pragma once
+        #define OBS_DATA_PATH "data"
+        #define OBS_INSTALL_PREFIX ""
+        #define OBS_PLUGIN_DESTINATION "obs-plugins/64bit"
+        #define OBS_RELEASE_CANDIDATE 0
+        #define OBS_BETA 0
+        '@
+        $content | Out-File -Encoding ascii obs-src/libobs/obsconfig.h
+        Get-Content obs-src/libobs/obsconfig.h
+
     - name: Configure CMake
       shell: pwsh
       run: |

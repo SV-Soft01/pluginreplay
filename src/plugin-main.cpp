@@ -53,7 +53,7 @@ static void OnFrontendEvent(enum obs_frontend_event event, void * /*private_data
 
         // Crear y acoplar el panel de interfaz en OBS Studio
         s_dock = new SVReplay::MultiCamDock();
-        obs_frontend_add_dock(s_dock);
+        obs_frontend_add_dock_by_id("sv_multicam_replay_dock", "SV MultiCam Replay", s_dock);
         blog(LOG_INFO, "[SV MultiCam] Panel acoplable agregado a la interfaz de OBS.");
         break;
 

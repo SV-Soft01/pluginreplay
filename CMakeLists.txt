@@ -30,7 +30,7 @@ if(NOT TARGET libobs)
     )
 
     find_file(LIBOBS_LIB
-        NAMES obs.lib obs.dll
+        NAMES obs.lib
         PATHS
         "${CMAKE_CURRENT_SOURCE_DIR}/obs-install/bin/64bit"
         "${CMAKE_CURRENT_SOURCE_DIR}/../obs-install/bin/64bit"
@@ -57,7 +57,7 @@ if(NOT TARGET obs-frontend-api)
     )
 
     find_file(OBS_FRONTEND_LIB
-        NAMES obs-frontend-api.lib obs-frontend-api.dll
+        NAMES obs-frontend-api.lib
         PATHS
         "${CMAKE_CURRENT_SOURCE_DIR}/obs-install/bin/64bit"
         "${CMAKE_CURRENT_SOURCE_DIR}/../obs-install/bin/64bit"

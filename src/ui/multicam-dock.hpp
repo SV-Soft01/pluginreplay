@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QDockWidget>
 #include <QWidget>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -17,7 +16,7 @@
 
 namespace SVReplay {
 
-class MultiCamDock : public QDockWidget {
+class MultiCamDock : public QWidget {
     Q_OBJECT
 
 public:

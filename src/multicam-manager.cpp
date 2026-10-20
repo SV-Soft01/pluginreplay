@@ -41,10 +41,9 @@ void MultiCamManager::Initialize()
     }
 
     // Ruta de salida por defecto en la carpeta de videos del usuario
-    char *userVideoPath = os_get_default_recording_path();
-    if (userVideoPath) {
-        m_outputDirectory = userVideoPath;
-        bfree(userVideoPath);
+    const char *userProfile = getenv("USERPROFILE");
+    if (userProfile) {
+        m_outputDirectory = std::string(userProfile) + "\\Videos\\Replays";
     } else {
         m_outputDirectory = "C:\\Replays";
     }
@@ -321,7 +320,7 @@ bool MultiCamManager::TriggerSaveReplay(SaveCompletionCallback callback)
 
 void MultiCamManager::LoadConfiguration()
 {
-    char *configPath = obs_module_config_path(obs_current_module(), "config.json");
+    char *configPath = obs_module_config_path("config.json");
     if (!configPath) {
         return;
     }
@@ -365,7 +364,7 @@ void MultiCamManager::LoadConfiguration()
 
 void MultiCamManager::SaveConfiguration()
 {
-    char *configPath = obs_module_config_path(obs_current_module(), "config.json");
+    char *configPath = obs_module_config_path("config.json");
     if (!configPath) {
         return;
     }

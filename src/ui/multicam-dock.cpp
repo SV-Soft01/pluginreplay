@@ -177,7 +177,7 @@ void MultiCamDock::RefreshAvailableSources()
     } context;
     context.listWidget = m_sourcesListWidget;
 
-    obs_enum_sources([](void *data, obs_source_t *source) -> bool {
+    obs_enum_sources([](void *param, obs_source_t *source) -> bool {
         if (!source) return true;
 
         uint32_t outputFlags = obs_source_get_output_flags(source);
@@ -191,7 +191,7 @@ void MultiCamDock::RefreshAvailableSources()
             return true;
         }
 
-        auto *ctx = static_cast<EnumContext*>(data);
+        auto *ctx = static_cast<EnumContext*>(param);
         auto *item = new QListWidgetItem(QString::fromUtf8(name), ctx->listWidget);
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
 

@@ -88,13 +88,17 @@ void SourceBuffer::RenderAndCapture(uint64_t current_time_ns)
             gs_stagesurface_destroy(m_stagesurf);
             m_stagesurf = nullptr;
         }
-        m_stagesurf = gs_stagesurf_create(width, height, GS_BGRA);
+        m_stagesurf = gs_stagesurface_create(width, height, GS_BGRA);
         m_currentWidth = width;
         m_currentHeight = height;
     }
 
     // Renderizar la fuente en la textura fuera de pantalla
     struct vec4 transparent = {0.0f, 0.0f, 0.0f, 0.0f};
+    transparent.x = 0.0f;
+    transparent.y = 0.0f;
+    transparent.z = 0.0f;
+    transparent.w = 0.0f;
     if (gs_texrender_begin(m_texrender, width, height)) {
         gs_clear(GS_CLEAR_COLOR, &transparent, 0.0f, 0.0f);
         obs_source_video_render(m_source);
@@ -111,7 +115,7 @@ void SourceBuffer::RenderAndCapture(uint64_t current_time_ns)
 
     uint8_t *data = nullptr;
     uint32_t linesize = 0;
-    if (gs_stagesurf_map(m_stagesurf, &data, &linesize)) {
+    if (gs_stagesurface_map(m_stagesurf, &data, &linesize)) {
         size_t frameSize = static_cast<size_t>(linesize) * height;
 
         VideoFramePacket packet;
@@ -122,7 +126,7 @@ void SourceBuffer::RenderAndCapture(uint64_t current_time_ns)
         packet.data.resize(frameSize);
         std::memcpy(packet.data.data(), data, frameSize);
 
-        gs_stagesurf_unmap(m_stagesurf);
+        gs_stagesurface_unmap(m_stagesurf);
 
         // Almacenar en el búfer circular protegiendo la sección crítica
         {

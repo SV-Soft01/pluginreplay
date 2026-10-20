@@ -1,3 +1,6 @@
+#ifdef _MSC_VER
+#pragma warning(disable: 4996)
+#endif
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include "multicam-manager.hpp"
@@ -25,8 +28,11 @@ MODULE_EXPORT const char *obs_module_author(void)
 static SVReplay::MultiCamDock *s_dock = nullptr;
 
 // Función ejecutada al presionar el atajo de teclado global registrado en OBS
-static void OnHotkeySaveReplay(void * /*data*/)
+static void OnHotkeySaveReplay(void * /*data*/, obs_hotkey_id /*id*/, obs_hotkey_t * /*hotkey*/, bool pressed)
 {
+    if (!pressed) {
+        return;
+    }
     blog(LOG_INFO, "[SV MultiCam] Atajo de teclado presionado: Guardando repetición multicámara...");
     SVReplay::MultiCamManager::Instance().TriggerSaveReplay([](const SVReplay::ReplaySaveResult &result) {
         if (result.success) {

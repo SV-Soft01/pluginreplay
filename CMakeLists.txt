@@ -10,22 +10,69 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Enable Qt Automoc, Autouic, Autorcc
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-# Find Qt 6 (Standard for OBS Studio 30, 31, 32)
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
 
-# Find libobs & obs-frontend-api
-# Can be provided via -DOBS_DIR="..." or standard find_package if OBS SDK is installed
-if(NOT TARGET obs-frontend-api OR NOT TARGET libobs)
-    find_package(libobs REQUIRED)
-    find_package(obs-frontend-api REQUIRED)
+find_package(libobs QUIET)
+find_package(obs-frontend-api QUIET)
+
+if(NOT TARGET libobs)
+    find_path(LIBOBS_INCLUDE_DIR obs.h
+        PATHS
+        "${CMAKE_CURRENT_SOURCE_DIR}/obs-src/libobs"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../obs-src/libobs"
+        "${OBS_DIR}/libobs"
+        "${OBS_DIR}/include"
+        "C:/Program Files/obs-studio/include"
+    )
+
+    find_file(LIBOBS_LIB
+        NAMES obs.lib obs.dll
+        PATHS
+        "${CMAKE_CURRENT_SOURCE_DIR}/obs-install/bin/64bit"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../obs-install/bin/64bit"
+        "${OBS_DIR}/bin/64bit"
+        "C:/Program Files/obs-studio/bin/64bit"
+    )
+
+    add_library(libobs UNKNOWN IMPORTED)
+    set_target_properties(libobs PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR};${LIBOBS_INCLUDE_DIR}/.."
+        IMPORTED_LOCATION "${LIBOBS_LIB}"
+        IMPORTED_IMPLIB "${LIBOBS_LIB}"
+    )
 endif()
 
-# Source files
+if(NOT TARGET obs-frontend-api)
+    find_path(OBS_FRONTEND_INCLUDE_DIR obs-frontend-api.h
+        PATHS
+        "${CMAKE_CURRENT_SOURCE_DIR}/obs-src/UI/obs-frontend-api"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../obs-src/UI/obs-frontend-api"
+        "${OBS_DIR}/UI/obs-frontend-api"
+        "${OBS_DIR}/include"
+        "C:/Program Files/obs-studio/include"
+    )
+
+    find_file(OBS_FRONTEND_LIB
+        NAMES obs-frontend-api.lib obs-frontend-api.dll
+        PATHS
+        "${CMAKE_CURRENT_SOURCE_DIR}/obs-install/bin/64bit"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../obs-install/bin/64bit"
+        "${OBS_DIR}/bin/64bit"
+        "C:/Program Files/obs-studio/bin/64bit"
+    )
+
+    add_library(obs-frontend-api UNKNOWN IMPORTED)
+    set_target_properties(obs-frontend-api PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${OBS_FRONTEND_INCLUDE_DIR}"
+        IMPORTED_LOCATION "${OBS_FRONTEND_LIB}"
+        IMPORTED_IMPLIB "${OBS_FRONTEND_LIB}"
+    )
+endif()
+
 set(SOURCES
     src/plugin-main.cpp
     src/multicam-manager.cpp
@@ -38,7 +85,6 @@ set(SOURCES
     src/ui/multicam-dock.hpp
 )
 
-# Create plugin shared library
 add_library(sv-multicam-replay MODULE ${SOURCES})
 
 target_include_directories(sv-multicam-replay PRIVATE
@@ -54,7 +100,6 @@ target_link_libraries(sv-multicam-replay PRIVATE
     Qt6::Widgets
 )
 
-# Compiler definitions & options
 target_compile_definitions(sv-multicam-replay PRIVATE
     UNICODE
     _UNICODE
@@ -69,21 +114,7 @@ if(MSVC)
     )
 endif()
 
-# Set output name and properties for OBS plugins
 set_target_properties(sv-multicam-replay PROPERTIES
     PREFIX ""
     OUTPUT_NAME "sv-multicam-replay"
 )
-
-# Installation targets for OBS Studio
-if(WIN32)
-    install(TARGETS sv-multicam-replay
-        RUNTIME DESTINATION "obs-plugins/64bit"
-        LIBRARY DESTINATION "obs-plugins/64bit"
-    )
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/data")
-        install(DIRECTORY "data/"
-            DESTINATION "data/obs-plugins/sv-multicam-replay"
-        )
-    endif()
-endif()

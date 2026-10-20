@@ -1,11 +1,13 @@
 #include "multicam-dock.hpp"
 #include "../multicam-manager.hpp"
+
 #include <obs.h>
 #include <obs-frontend-api.h>
+
+#include <QApplication>
 #include <QFileDialog>
 #include <QHeaderView>
 #include <QMessageBox>
-#include <QApplication>
 
 namespace SVReplay {
 
@@ -17,6 +19,10 @@ MultiCamDock::MultiCamDock(QWidget *parent)
     SetupUI();
     LoadSettingsToUI();
     RefreshAvailableSources();
+
+    MultiCamManager::Instance().SetResultListener([this](const SaveResult &result) {
+        OnSaveResult(result);
+    });
 
     m_refreshTimer = new QTimer(this);
     connect(m_refreshTimer, &QTimer::timeout, this, &MultiCamDock::OnPeriodicStatusUpdate);
@@ -52,7 +58,7 @@ void MultiCamDock::SetupUI()
     mainLayout->addWidget(sourcesGroup);
 
     // 2. Grupo: Configuración del Búfer
-    auto *bufferGroup = new QGroupBox("Configuración del Búfer Circular", mainContainer);
+    auto *bufferGroup = new QGroupBox("Configuración del Búfer Circular (H.264 Comprimido)", mainContainer);
     auto *bufferLayout = new QVBoxLayout(bufferGroup);
 
     auto *durationHBox = new QHBoxLayout();
@@ -124,7 +130,7 @@ void MultiCamDock::SetupUI()
     auto *actionLayout = new QVBoxLayout();
 
     auto *hotkeyNotice = new QLabel(
-        "Atajo configurado en: <b>Ajustes de OBS -> Atajos -> SV MultiCam Replay</b>",
+        "Atajo configurable en: <b>Ajustes de OBS -> Atajos -> SV MultiCam Replay</b>",
         mainContainer
     );
     hotkeyNotice->setStyleSheet("color: #7f8c8d; font-size: 11px;");
@@ -155,16 +161,17 @@ void MultiCamDock::SetupUI()
     auto *outerLayout = new QVBoxLayout(this);
     outerLayout->setContentsMargins(0, 0, 0, 0);
     outerLayout->addWidget(mainContainer);
+
     connect(m_sourcesListWidget, &QListWidget::itemChanged, this, &MultiCamDock::OnSourceItemChanged);
 }
 
 void MultiCamDock::LoadSettingsToUI()
 {
-    auto &mgr = MultiCamManager::Instance();
-    m_durationSpinBox->setValue(mgr.GetBufferDuration());
-    m_durationSlider->setValue(mgr.GetBufferDuration());
-    m_dirLineEdit->setText(QString::fromStdString(mgr.GetOutputDirectory()));
-    m_prefixLineEdit->setText(QString::fromStdString(mgr.GetFilePrefix()));
+    auto settings = MultiCamManager::Instance().GetSettings();
+    m_durationSpinBox->setValue(settings.bufferSeconds);
+    m_durationSlider->setValue(settings.bufferSeconds);
+    m_dirLineEdit->setText(QString::fromStdString(settings.outputDirectory));
+    m_prefixLineEdit->setText(QString::fromStdString(settings.filePrefix));
     UpdateMemoryEstimate();
 }
 
@@ -182,7 +189,6 @@ void MultiCamDock::RefreshAvailableSources()
         if (!source) return true;
 
         uint32_t outputFlags = obs_source_get_output_flags(source);
-        // Filtrar únicamente fuentes con salida de video
         if ((outputFlags & OBS_SOURCE_VIDEO) == 0) {
             return true;
         }
@@ -196,8 +202,8 @@ void MultiCamDock::RefreshAvailableSources()
         auto *item = new QListWidgetItem(QString::fromUtf8(name), ctx->listWidget);
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
 
-        bool isActive = MultiCamManager::Instance().IsSourceActive(name);
-        item->setCheckState(isActive ? Qt::Checked : Qt::Unchecked);
+        bool isEnabled = MultiCamManager::Instance().IsCameraEnabled(name);
+        item->setCheckState(isEnabled ? Qt::Checked : Qt::Unchecked);
 
         return true;
     }, &context);
@@ -212,15 +218,15 @@ void MultiCamDock::OnSourceItemChanged(QListWidgetItem *item)
     std::string sourceName = item->text().toStdString();
     bool checked = (item->checkState() == Qt::Checked);
 
-    MultiCamManager::Instance().SetSourceActive(sourceName, checked);
-    MultiCamManager::Instance().SaveConfiguration();
+    MultiCamManager::Instance().SetCameraEnabled(sourceName, checked);
     UpdateMemoryEstimate();
 }
 
 void MultiCamDock::OnDurationChanged(int value)
 {
-    MultiCamManager::Instance().SetBufferDuration(value);
-    MultiCamManager::Instance().SaveConfiguration();
+    auto s = MultiCamManager::Instance().GetSettings();
+    s.bufferSeconds = value;
+    MultiCamManager::Instance().UpdateSettings(s);
     UpdateMemoryEstimate();
 }
 
@@ -235,101 +241,131 @@ void MultiCamDock::OnBrowseDirectory()
 
     if (!selected.isEmpty()) {
         m_dirLineEdit->setText(selected);
-        MultiCamManager::Instance().SetOutputDirectory(selected.toStdString());
-        MultiCamManager::Instance().SaveConfiguration();
+        auto s = MultiCamManager::Instance().GetSettings();
+        s.outputDirectory = selected.toStdString();
+        MultiCamManager::Instance().UpdateSettings(s);
     }
 }
 
 void MultiCamDock::OnPrefixChanged(const QString &text)
 {
-    MultiCamManager::Instance().SetFilePrefix(text.toStdString());
-    MultiCamManager::Instance().SaveConfiguration();
+    auto s = MultiCamManager::Instance().GetSettings();
+    s.filePrefix = text.toStdString();
+    MultiCamManager::Instance().UpdateSettings(s);
 }
 
 void MultiCamDock::UpdateMemoryEstimate()
 {
-    auto activeSources = MultiCamManager::Instance().GetActiveSources();
+    auto cameras = MultiCamManager::Instance().GetEnabledCameras();
     int duration = m_durationSpinBox->value();
 
-    // Estimación empírica en base a 1080p60 a 20Mbps por stream codificado en búfer
-    double estimatedMbPerStream = (2.5 * duration);
-    double totalEstimatedMb = activeSources.size() * estimatedMbPerStream;
+    // Estimación empírica para video comprimido H.264 (~1.5 MB por segundo por cámara)
+    double estimatedMbPerCamera = (1.5 * duration);
+    double totalEstimatedMb = cameras.size() * estimatedMbPerCamera;
 
     m_memoryEstimateLabel->setText(
         QString("Memoria estimada en RAM: ~%1 MB (%2 cámaras activas)")
             .arg(static_cast<int>(totalEstimatedMb))
-            .arg(activeSources.size())
+            .arg(cameras.size())
     );
 }
 
 void MultiCamDock::OnTriggerSaveTestReplay()
 {
-    m_saveReplayBtn->setEnabled(false);
-    m_saveProgressBar->setVisible(true);
-    m_statusMessageLabel->setStyleSheet("color: #e67e22; font-weight: bold;");
-    m_statusMessageLabel->setText("Procesando repetición y empaquetando archivos MP4...");
-
-    bool started = MultiCamManager::Instance().TriggerSaveReplay([this](const ReplaySaveResult &result) {
-        // Ejecutar en el hilo de la interfaz de Qt de forma segura
-        QMetaObject::invokeMethod(this, [this, result]() {
-            m_saveReplayBtn->setEnabled(true);
-            m_saveProgressBar->setVisible(false);
-
-            if (result.success) {
-                m_statusMessageLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
-                m_statusMessageLabel->setText(
-                    QString("¡Repetición #%1 guardada con éxito! (%2 clips generados)")
-                        .arg(result.playId, 4, 10, QChar('0'))
-                        .arg(result.totalClips)
-                );
-            } else {
-                m_statusMessageLabel->setStyleSheet("color: #c0392b; font-weight: bold;");
-                m_statusMessageLabel->setText(
-                    QString("Error al guardar algunos clips. Revisa los registros de OBS.")
-                );
-            }
-        });
-    });
+    std::string error;
+    bool started = MultiCamManager::Instance().TriggerSaveReplay(&error);
 
     if (!started) {
         m_saveReplayBtn->setEnabled(true);
         m_saveProgressBar->setVisible(false);
         m_statusMessageLabel->setStyleSheet("color: #c0392b; font-weight: bold;");
-        m_statusMessageLabel->setText("No se pudo iniciar el guardado. Verifica que haya cámaras seleccionadas.");
+        m_statusMessageLabel->setText(QString::fromStdString(error.empty() ? "No se pudo iniciar el guardado." : error));
+    } else {
+        m_saveReplayBtn->setEnabled(false);
+        m_saveProgressBar->setVisible(true);
+        m_statusMessageLabel->setStyleSheet("color: #e67e22; font-weight: bold;");
+        m_statusMessageLabel->setText("Procesando repetición y empaquetando clips MP4...");
     }
+}
+
+void MultiCamDock::OnSaveResult(const SaveResult &result)
+{
+    QMetaObject::invokeMethod(this, [this, result]() {
+        m_saveReplayBtn->setEnabled(true);
+        m_saveProgressBar->setVisible(false);
+
+        if (result.success) {
+            m_statusMessageLabel->setStyleSheet("color: #27ae60; font-weight: bold;");
+            m_statusMessageLabel->setText(
+                QString("¡Repetición #%1 guardada con éxito! (%2 clips sincronizados)")
+                    .arg(result.playId, 4, 10, QChar('0'))
+                    .arg(result.totalClips)
+            );
+        } else {
+            m_statusMessageLabel->setStyleSheet("color: #c0392b; font-weight: bold;");
+            QString err = result.errors.empty() ? "Error al guardar los clips." : QString::fromStdString(result.errors[0]);
+            m_statusMessageLabel->setText(err);
+        }
+    });
 }
 
 void MultiCamDock::OnPeriodicStatusUpdate()
 {
-    auto activeSources = MultiCamManager::Instance().GetActiveSources();
-    m_statusTableWidget->setRowCount(static_cast<int>(activeSources.size()));
+    auto statuses = MultiCamManager::Instance().GetStatuses();
+    m_statusTableWidget->setRowCount(static_cast<int>(statuses.size()));
 
-    for (int i = 0; i < static_cast<int>(activeSources.size()); ++i) {
-        const auto &sName = activeSources[i];
-        std::string status = MultiCamManager::Instance().GetSourceStatusString(sName);
-        size_t frames = MultiCamManager::Instance().GetSourceBufferedFrames(sName);
-        double seconds = MultiCamManager::Instance().GetSourceBufferedSeconds(sName);
+    for (int i = 0; i < static_cast<int>(statuses.size()); ++i) {
+        const auto &st = statuses[i];
+        QString stateStr;
+        switch (st.state) {
+        case PipelineState::Running:
+            stateStr = "Búfer Activo";
+            break;
+        case PipelineState::Starting:
+            stateStr = "Iniciando...";
+            break;
+        case PipelineState::WaitingForSource:
+            stateStr = QString::fromStdString(st.detail.empty() ? "Esperando Fuente" : st.detail);
+            break;
+        case PipelineState::Error:
+            stateStr = QString::fromStdString(st.detail.empty() ? "Error" : st.detail);
+            break;
+        case PipelineState::Stopped:
+        default:
+            stateStr = "Detenido";
+            break;
+        }
 
-        auto *nameItem = new QTableWidgetItem(QString::fromStdString(sName));
-        auto *statusItem = new QTableWidgetItem(QString::fromStdString(status));
-        auto *framesItem = new QTableWidgetItem(QString::number(frames));
-        auto *secondsItem = new QTableWidgetItem(QString::number(seconds, 'f', 1) + " s");
+        size_t approxFrames = static_cast<size_t>(st.bufferedSeconds * 60.0);
+
+        auto *nameItem = new QTableWidgetItem(QString::fromStdString(st.name));
+        auto *statusItem = new QTableWidgetItem(stateStr);
+        auto *framesItem = new QTableWidgetItem(QString::number(approxFrames));
+        auto *secondsItem = new QTableWidgetItem(QString::number(st.bufferedSeconds, 'f', 1) + " s");
 
         nameItem->setTextAlignment(Qt::AlignCenter);
         statusItem->setTextAlignment(Qt::AlignCenter);
         framesItem->setTextAlignment(Qt::AlignCenter);
         secondsItem->setTextAlignment(Qt::AlignCenter);
 
-        if (status == "Búfer Activo") {
+        if (st.state == PipelineState::Running) {
             statusItem->setForeground(QBrush(QColor("#27ae60")));
-        } else if (status == "Error en Fuente") {
+        } else if (st.state == PipelineState::Error) {
             statusItem->setForeground(QBrush(QColor("#c0392b")));
+        } else if (st.state == PipelineState::WaitingForSource) {
+            statusItem->setForeground(QBrush(QColor("#e67e22")));
         }
 
         m_statusTableWidget->setItem(i, 0, nameItem);
         m_statusTableWidget->setItem(i, 1, statusItem);
         m_statusTableWidget->setItem(i, 2, framesItem);
         m_statusTableWidget->setItem(i, 3, secondsItem);
+    }
+
+    bool saving = MultiCamManager::Instance().IsSaving();
+    if (!saving && !m_saveReplayBtn->isEnabled()) {
+        m_saveReplayBtn->setEnabled(true);
+        m_saveProgressBar->setVisible(false);
     }
 }
 

@@ -14,6 +14,8 @@
 #include <QTimer>
 #include <QGroupBox>
 
+#include "replay-types.hpp"
+
 namespace SVReplay {
 
 class MultiCamDock : public QWidget {
@@ -37,6 +39,7 @@ private:
     void SetupUI();
     void LoadSettingsToUI();
     void UpdateMemoryEstimate();
+    void OnSaveResult(const SaveResult &result);
 
     // Controles de UI
     QListWidget *m_sourcesListWidget = nullptr;

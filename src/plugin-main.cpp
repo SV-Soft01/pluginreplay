@@ -68,7 +68,7 @@ static void OnFrontendEvent(enum obs_frontend_event event, void * /*private_data
     }
 }
 
-bool obs_module_load(void)
+MODULE_EXPORT bool obs_module_load(void)
 {
     blog(LOG_INFO, "[SV MultiCam] Cargando plugin SV MultiCam Replay v1.0.0...");
 
@@ -87,7 +87,7 @@ bool obs_module_load(void)
     return true;
 }
 
-void obs_module_unload(void)
+MODULE_EXPORT void obs_module_unload(void)
 {
     blog(LOG_INFO, "[SV MultiCam] Descargando plugin SV MultiCam Replay...");
     SVReplay::MultiCamManager::Instance().Shutdown();

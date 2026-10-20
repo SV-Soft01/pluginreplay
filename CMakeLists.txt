@@ -75,12 +75,11 @@ endif()
 
 set(SOURCES
     src/plugin-main.cpp
+    src/replay-types.hpp
+    src/camera-pipeline.cpp
+    src/camera-pipeline.hpp
     src/multicam-manager.cpp
     src/multicam-manager.hpp
-    src/source-buffer.cpp
-    src/source-buffer.hpp
-    src/mp4-muxer.cpp
-    src/mp4-muxer.hpp
     src/ui/multicam-dock.cpp
     src/ui/multicam-dock.hpp
 )
@@ -103,6 +102,7 @@ target_link_libraries(sv-multicam-replay PRIVATE
 target_compile_definitions(sv-multicam-replay PRIVATE
     UNICODE
     _UNICODE
+    _CRT_SECURE_NO_WARNINGS
     SV_PLUGIN_VERSION="${PROJECT_VERSION}"
 )
 

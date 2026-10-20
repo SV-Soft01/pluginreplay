@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+env:
+  OBS_VERSION: "32.1.2"
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -27,9 +30,9 @@ jobs:
     - name: Setup OBS Studio Prebuilt SDK
       shell: pwsh
       run: |
-        curl.exe -L -o obs-studio.zip https://github.com/obsproject/obs-studio/releases/download/30.2.3/OBS-Studio-30.2.3-Windows.zip
+        curl.exe -L -o obs-studio.zip "https://github.com/obsproject/obs-studio/releases/download/$env:OBS_VERSION/OBS-Studio-$env:OBS_VERSION-Windows-x64.zip"
         7z.exe x obs-studio.zip -oobs-install
-        git clone --depth 1 --branch 30.2.3 https://github.com/obsproject/obs-studio.git obs-src
+        git clone --depth 1 --branch $env:OBS_VERSION https://github.com/obsproject/obs-studio.git obs-src
 
         # Generate import library obs.lib from obs.dll
         "EXPORTS" | Out-File -Encoding ascii obs.def
@@ -51,14 +54,41 @@ jobs:
         }
         lib.exe /def:obs-frontend-api.def /out:obs-install/bin/64bit/obs-frontend-api.lib /machine:x64
 
+    - name: Locate OBS headers
+      shell: pwsh
+      run: |
+        # En OBS 31+ la carpeta UI fue renombrada, asi que buscamos el header en vez de asumir la ruta
+        $frontendHeader = Get-ChildItem -Recurse -Path obs-src -Filter obs-frontend-api.h | Select-Object -First 1
+        if (-not $frontendHeader) { throw "No se encontro obs-frontend-api.h en obs-src" }
+        $frontendDir = $frontendHeader.DirectoryName -replace '\\','/'
+        $libobsDir = (Resolve-Path obs-src/libobs).Path -replace '\\','/'
+        $binDir = (Resolve-Path obs-install/bin/64bit).Path -replace '\\','/'
+        Write-Host "frontend include: $frontendDir"
+        Write-Host "libobs include:   $libobsDir"
+        "OBS_FRONTEND_INC=$frontendDir" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+        "LIBOBS_INC=$libobsDir" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+        "OBS_BIN=$binDir" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+
     - name: Configure CMake
+      shell: pwsh
       run: |
         if (Test-Path build) { Remove-Item -Recurse -Force build }
-        cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release
+        cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release `
+          "-DLIBOBS_INCLUDE_DIR=$env:LIBOBS_INC" `
+          "-DLIBOBS_LIB=$env:OBS_BIN/obs.lib" `
+          "-DOBS_FRONTEND_INCLUDE_DIR=$env:OBS_FRONTEND_INC" `
+          "-DOBS_FRONTEND_LIB=$env:OBS_BIN/obs-frontend-api.lib"
 
     - name: Build Plugin (Release)
       run: |
         cmake --build build
+
+    - name: Diagnostico de dependencias de la DLL
+      shell: pwsh
+      run: |
+        $dll = Get-ChildItem -Recurse build -Filter sv-multicam-replay.dll | Select-Object -First 1
+        Write-Host "DLL: $($dll.FullName)"
+        dumpbin /dependents $dll.FullName
 
     - name: Upload Compiled Plugin DLL
       uses: actions/upload-artifact@v4
